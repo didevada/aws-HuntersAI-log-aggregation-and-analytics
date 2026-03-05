@@ -1,0 +1,436 @@
+# Required KMS, S3 and IAM role permissions
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KMS Key permissions for SIEM S3 bucket, GuardDuty and CW Logs sent to S3 via Kinesis
+# ─────────────────────────────────────────────────────────────────────────────
+kms_key_policy:
+  Version: "2012-10-17"
+  Id: "SIEM S3 KMS Policy"
+  Statement:
+    - Sid: "Allow Logs Delivery to use the key"
+      Effect: Allow
+      Principal:
+        Service: delivery.logs.amazonaws.com
+      Action:
+        - kms:Encrypt
+        - kms:Decrypt
+        - "kms:ReEncrypt*"
+        - "kms:GenerateDataKey*"
+        - kms:DescribeKey
+      Resource: "*"
+      Condition:
+        StringEquals:
+          aws:SourceAccount:
+            - "[LOGGING-ACCOUNT-ID]"
+            - "[MEMBER-ACCOUNT-ID]"
+        ArnLike:
+          aws:SourceArn:
+            - "arn:aws:logs:*:[LOGGING-ACCOUNT-ID]:*"
+            - "arn:aws:logs:*:[MEMBER-ACCOUNT-ID]:*"
+
+    - Sid: "Allow GuardDuty to encrypt findings"
+      Effect: Allow
+      Principal:
+        Service: guardduty.amazonaws.com
+      Action: kms:GenerateDataKey
+      Resource: "*"
+      Condition:
+        StringEquals:
+          aws:SourceAccount:
+            - "[LOGGING-ACCOUNT-ID]"
+            - "[MEMBER-ACCOUNT-ID]"
+          aws:SourceArn: "arn:aws:guardduty:ap-southeast-2:[GUARDDUTY-ACCOUNT-ID]:detector/[GUARDDUTY-DETECTOR-ID]"
+
+    - Sid: "Enable IAM User Permissions for all Actions"
+      Effect: Allow
+      Principal:
+        AWS: "arn:aws:iam::[LOGGING-ACCOUNT-ID]:role/ams-logging-admin"
+      Action: "kms:*"
+      Resource: "*"
+
+    - Sid: "Enable IAM User Permissions for all Actions except delete"
+      Effect: Allow
+      Principal:
+        AWS: "arn:aws:iam::[LOGGING-ACCOUNT-ID]:root"
+      NotAction:
+        - kms:ScheduleKeyDeletion
+        - kms:DeleteImportedKeyMaterial
+      Resource: "*"
+
+    - Sid: "Enable IAM User Permissions"
+      Effect: Allow
+      Principal:
+        AWS: "arn:aws:iam::[LOGGING-ACCOUNT-ID]:root"
+      Action:
+        - "kms:Encrypt*"
+        - "kms:Decrypt*"
+        - "kms:Describe*"
+      Resource: "*"
+
+    - Sid: "Allow CloudTrail to encrypt logs"
+      Effect: Allow
+      Principal:
+        Service: cloudtrail.amazonaws.com
+      Action:
+        - "kms:Encrypt*"
+        - "kms:Decrypt*"
+        - "kms:Describe*"
+        - "kms:GenerateDataKey*"
+      Resource: "*"
+      Condition:
+        StringLike:
+          "kms:EncryptionContext:aws:cloudtrail:arn": "arn:aws:cloudtrail:ap-southeast-2:*:trail/AWS-Landing-Zone-BaselineCloudTrail"
+
+    - Sid: "Allow s3 and cloudwatch log to encrypt logs"
+      Effect: Allow
+      Principal:
+        Service:
+          - logs.amazonaws.com
+          - s3.amazonaws.com
+          - firehose.amazonaws.com
+      Action:
+        - "kms:Encrypt*"
+        - "kms:Decrypt*"
+        - "kms:Describe*"
+        - "kms:GenerateDataKey*"
+      Resource: "*"
+
+    - Sid: "Allow use of the key"
+      Effect: Allow
+      Principal:
+        AWS: "arn:aws:iam::[LOGGING-ACCOUNT-ID]:role/customer-hunter-assumed-role"
+      Action:
+        - kms:Decrypt
+        - "kms:Describe*"
+      Resource: "*"
+
+    - Sid: "Allow CWL Service Principal usage"
+      Effect: Allow
+      Principal:
+        Service: logs.ap-southeast-2.amazonaws.com
+      Action:
+        - kms:GenerateDataKey
+        - kms:Decrypt
+      Resource: "*"
+
+    - Sid: "IAM Role GetPolicy Permissions"
+      Effect: Allow
+      Principal:
+        AWS:
+          - "arn:aws:iam::[LOGGING-ACCOUNT-ID]:root"
+          - "arn:aws:iam::[MEMBER-ACCOUNT-ID]:root"
+      Action:
+        - "kms:GetKeyPolicy*"
+        - "kms:PutKeyPolicy*"
+        - "kms:DescribeKey*"
+        - "kms:CreateAlias*"
+        - "kms:ScheduleKeyDeletion*"
+        - kms:Decrypt
+      Resource: "*"
+
+    - Sid: "Enable IAM Role Permissions"
+      Effect: Allow
+      Principal:
+        AWS:
+          - "arn:aws:iam::[LOGGING-ACCOUNT-ID]:root"
+          - "arn:aws:iam::[MEMBER-ACCOUNT-ID]:root"
+      Action:
+        - kms:GenerateDataKey
+        - kms:Decrypt
+      Resource: "*"
+
+    - Sid: "Allow use of the key 2"
+      Effect: Allow
+      Principal:
+        AWS: "arn:aws:iam::[LOGGING-ACCOUNT-ID]:role/customer-hunter-assumed-role"
+      Action:
+        - kms:Decrypt
+        - "kms:Describe*"
+      Resource:
+        - "arn:aws:kms:ap-southeast-2:[LOGGING-ACCOUNT-ID]:key/12516584-d518-4b3a-a212-e183b1c53ec9"
+        - "arn:aws:kms:ap-southeast-2:[LOGGING-ACCOUNT-ID]:key/e947a771-6134-4157-b3a7-94f3167bd19e"
+
+    - Sid: "Encrypt permission on SIEM Key"
+      Effect: Allow
+      Principal:
+        AWS: "arn:aws:iam::[LOGGING-ACCOUNT-ID]:role/customer-hunter-assumed-role"
+      Action:
+        - "kms:Describe*"
+        - "kms:ReEncrypt*"
+        - kms:Encrypt
+        - kms:GenerateDataKey
+      Resource: "arn:aws:kms:ap-southeast-2:[LOGGING-ACCOUNT-ID]:key/12516584-d518-4b3a-a212-e183b1c53ec9"
+
+    - Sid: "AllowFirehoseUse"
+      Effect: Allow
+      Principal:
+        Service: firehose.amazonaws.com
+      Action:
+        - kms:Decrypt
+        - kms:GenerateDataKey
+      Resource: "arn:aws:kms:ap-southeast-2:[LOGGING-ACCOUNT-ID]:key/12516584-d518-4b3a-a212-e183b1c53ec9"
+
+    - Sid: "AllowKinesisUse"
+      Effect: Allow
+      Principal:
+        Service: kinesis.amazonaws.com
+      Action:
+        - kms:Decrypt
+        - kms:GenerateDataKey
+      Resource: "arn:aws:kms:ap-southeast-2:[LOGGING-ACCOUNT-ID]:key/12516584-d518-4b3a-a212-e183b1c53ec9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Central SIEM S3 Bucket Policy
+# ─────────────────────────────────────────────────────────────────────────────
+s3_bucket_policy:
+  Version: "2012-10-17"
+  Id: "SIEMWritePermissions"
+  Statement:
+    - Sid: "AWSLogDeliveryWrite1"
+      Effect: Allow
+      Principal:
+        Service: delivery.logs.amazonaws.com
+      Action: s3:PutObject
+      Resource: "arn:aws:s3:::siem-logging-bucket-ap-southeast-2/*"
+      Condition:
+        StringEquals:
+          s3:x-amz-acl: bucket-owner-full-control
+          aws:SourceAccount:
+            - "[LOGGING-ACCOUNT-ID]"
+            - "[MEMBER-ACCOUNT-ID]"
+        ArnLike:
+          aws:SourceArn:
+            - "arn:aws:logs:*:[LOGGING-ACCOUNT-ID]:*"
+            - "arn:aws:logs:*:[MEMBER-ACCOUNT-ID]:*"
+
+    - Sid: "AWSLogDeliveryAclCheck1"
+      Effect: Allow
+      Principal:
+        Service: delivery.logs.amazonaws.com
+      Action: s3:GetBucketAcl
+      Resource: "arn:aws:s3:::siem-logging-bucket-ap-southeast-2"
+      Condition:
+        StringEquals:
+          aws:SourceAccount:
+            - "[LOGGING-ACCOUNT-ID]"
+            - "[MEMBER-ACCOUNT-ID]"
+        ArnLike:
+          aws:SourceArn:
+            - "arn:aws:logs:*:[LOGGING-ACCOUNT-ID]:*"
+            - "arn:aws:logs:*:[MEMBER-ACCOUNT-ID]:*"
+
+    - Sid: "AWSCloudTrailAclCheck20150319"
+      Effect: Allow
+      Principal:
+        Service: cloudtrail.amazonaws.com
+      Action: s3:GetBucketAcl
+      Resource: "arn:aws:s3:::siem-logging-bucket-ap-southeast-2"
+      Condition:
+        StringEquals:
+          aws:SourceArn:
+            - "arn:aws:cloudtrail:ap-southeast-2:[LOGGING-ACCOUNT-ID]:trail/AWS-Landing-Zone-BaselineCloudTrail"
+            - "arn:aws:cloudtrail:ap-southeast-2:[MEMBER-ACCOUNT-ID]:trail/AWS-Landing-Zone-BaselineCloudTrail"
+
+    - Sid: "AWSCloudTrailWrite20150319"
+      Effect: Allow
+      Principal:
+        Service: cloudtrail.amazonaws.com
+      Action: s3:PutObject
+      Resource: "arn:aws:s3:::siem-logging-bucket-ap-southeast-2/*"
+      Condition:
+        StringEquals:
+          s3:x-amz-acl: bucket-owner-full-control
+          aws:SourceArn:
+            - "arn:aws:cloudtrail:ap-southeast-2:[LOGGING-ACCOUNT-ID]:trail/AWS-Landing-Zone-BaselineCloudTrail"
+            - "arn:aws:cloudtrail:ap-southeast-2:[MEMBER-ACCOUNT-ID]:trail/AWS-Landing-Zone-BaselineCloudTrail"
+
+    - Sid: "Allow PutObject"
+      Effect: Allow
+      Principal:
+        Service: guardduty.amazonaws.com
+      Action: s3:PutObject
+      Resource: "arn:aws:s3:::siem-logging-bucket-ap-southeast-2/*"
+      Condition:
+        StringEquals:
+          aws:SourceArn: "arn:aws:guardduty:ap-southeast-2:[GUARDDUTY-ACCOUNT-ID]:detector/[GUARDDUTY-DETECTOR-ID]"
+          aws:SourceAccount: "[GUARDDUTY-ACCOUNT-ID]"
+
+    - Sid: "Allow GetBucketLocation"
+      Effect: Allow
+      Principal:
+        Service: guardduty.amazonaws.com
+      Action: s3:GetBucketLocation
+      Resource: "arn:aws:s3:::siem-logging-bucket-ap-southeast-2"
+      Condition:
+        StringEquals:
+          aws:SourceArn: "arn:aws:guardduty:ap-southeast-2:[GUARDDUTY-ACCOUNT-ID]:detector/[GUARDDUTY-DETECTOR-ID]"
+          aws:SourceAccount: "[GUARDDUTY-ACCOUNT-ID]"
+
+    - Effect: Allow
+      Principal:
+        Service: logs.ap-southeast-2.amazonaws.com
+      Action: s3:GetBucketAcl
+      Resource: "arn:aws:s3:::siem-logging-bucket-ap-southeast-2"
+      Condition:
+        StringEquals:
+          aws:SourceAccount:
+            - "[LOGGING-ACCOUNT-ID]"
+            - "[MEMBER-ACCOUNT-ID]"
+        ArnLike:
+          aws:SourceArn:
+            - "arn:aws:logs:ap-southeast-2:[LOGGING-ACCOUNT-ID]:log-group:*"
+            - "arn:aws:logs:ap-southeast-2:[MEMBER-ACCOUNT-ID]:log-group:*"
+
+    - Effect: Allow
+      Principal:
+        Service: logs.ap-southeast-2.amazonaws.com
+      Action: s3:PutObject
+      Resource: "arn:aws:s3:::siem-logging-bucket-ap-southeast-2/*"
+      Condition:
+        StringEquals:
+          s3:x-amz-acl: bucket-owner-full-control
+          aws:SourceAccount:
+            - "[LOGGING-ACCOUNT-ID]"
+            - "[MEMBER-ACCOUNT-ID]"
+        ArnLike:
+          aws:SourceArn:
+            - "arn:aws:logs:ap-southeast-2:[LOGGING-ACCOUNT-ID]:log-group:*"
+            - "arn:aws:logs:ap-southeast-2:[MEMBER-ACCOUNT-ID]:log-group:*"
+
+    - Effect: Allow
+      Principal:
+        AWS:
+          - "arn:aws:iam::[LOGGING-ACCOUNT-ID]:root"
+          - "arn:aws:iam::[MEMBER-ACCOUNT-ID]:root"
+      Action: s3:PutObject
+      Resource: "arn:aws:s3:::siem-logging-bucket-ap-southeast-2/*"
+      Condition:
+        StringEquals:
+          s3:x-amz-acl: bucket-owner-full-control
+
+    - Sid: "Deny incorrect encryption header"
+      Effect: Deny
+      Principal:
+        Service: guardduty.amazonaws.com
+      Action: s3:PutObject
+      Resource: "arn:aws:s3:::siem-logging-bucket-ap-southeast-2/*"
+      Condition:
+        StringNotEquals:
+          s3:x-amz-server-side-encryption-aws-kms-key-id: "arn:aws:kms:ap-southeast-2:[LOGGING-ACCOUNT-ID]:key/12516584-d518-4b3a-a212-e183b1c53ec9"
+
+    - Sid: "Deny unencrypted object uploads"
+      Effect: Deny
+      Principal:
+        Service: guardduty.amazonaws.com
+      Action: s3:PutObject
+      Resource: "arn:aws:s3:::siem-logging-bucket-ap-southeast-2/*"
+      Condition:
+        StringNotEquals:
+          s3:x-amz-server-side-encryption: "aws:kms"
+
+    - Sid: "Deny non-HTTPS access"
+      Effect: Deny
+      Principal:
+        Service: guardduty.amazonaws.com
+      Action: "s3:*"
+      Resource: "arn:aws:s3:::siem-logging-bucket-ap-southeast-2/*"
+      Condition:
+        Bool:
+          aws:SecureTransport: "false"
+
+    - Sid: "AllowFirehoseAccess"
+      Effect: Allow
+      Principal:
+        Service: firehose.amazonaws.com
+      Action:
+        - s3:AbortMultipartUpload
+        - s3:GetBucketLocation
+        - s3:GetObject
+        - s3:ListBucket
+        - s3:ListBucketMultipartUploads
+        - s3:PutObject
+        - s3:PutObjectAcl
+        - s3:GetBucketAcl
+      Resource:
+        - "arn:aws:s3:::siem-logging-bucket-ap-southeast-2"
+        - "arn:aws:s3:::siem-logging-bucket-ap-southeast-2/*"
+
+    - Sid: "Allow S3 Access Cross-account"
+      Effect: Allow
+      Principal:
+        AWS: "arn:aws:iam::[GUARDDUTY-ACCOUNT-ID]:role/ams-security-operations"
+      Action:
+        - s3:ListBucket
+        - s3:GetObject
+      Resource:
+        - "arn:aws:s3:::siem-logging-bucket-ap-southeast-2"
+        - "arn:aws:s3:::siem-logging-bucket-ap-southeast-2/CustomGuardDutyLogs/*"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hunters AI Federation Role
+# Permissions: S3 Read, S3 Cross Bucket Replication, KMS Re-encryption
+# ─────────────────────────────────────────────────────────────────────────────
+hunters_ai_federation_role_policy:
+  Version: "2012-10-17"
+  Statement:
+    - Sid: "S3ReadPermissions"
+      Action: s3:ListAllMyBuckets
+      Resource: "*"
+      Effect: Allow
+
+    - Action:
+        - s3:ListBucket
+        - s3:GetBucketLocation
+        - s3:GetReplicationConfiguration
+        - s3:GetBucketVersioning
+        - s3:PutBucketVersioning
+        - s3:PutInventoryConfiguration
+        - s3:InitiateReplication
+      Resource:
+        - "arn:aws:s3:::aws-landing-zone-logs-[LOGGING-ACCOUNT-ID]-ap-southeast-2"
+        - "arn:aws:s3:::siem-logging-bucket-ap-southeast-2"
+        - "arn:aws:s3:::aws-landing-zone-logs-[LOGGING-ACCOUNT-ID]-ap-southeast-2/*"
+        - "arn:aws:s3:::siem-logging-bucket-ap-southeast-2/*"
+      Effect: Allow
+
+    - Action:
+        - s3:GetObjectVersionForReplication
+        - s3:GetObjectVersionAcl
+        - s3:GetObjectVersionTagging
+        - s3:GetObject
+      Resource:
+        - "arn:aws:s3:::aws-landing-zone-logs-[LOGGING-ACCOUNT-ID]-ap-southeast-2/*"
+      Effect: Allow
+
+    - Action:
+        - s3:ReplicateObject
+        - s3:ReplicateDelete
+        - s3:GetObject
+        - s3:ObjectOwnerOverrideToBucketOwner
+        - s3:GetObjectVersionTagging
+        - s3:ReplicateTags
+        - s3:PutObject
+        - s3:PutObjectAcl
+        - s3:PutObjectTagging
+      Resource: "arn:aws:s3:::siem-logging-bucket-ap-southeast-2/*"
+      Effect: Allow
+
+    - Action:
+        - kms:Decrypt
+        - kms:DescribeKey
+      Resource: "arn:aws:kms:ap-southeast-2:[LOGGING-ACCOUNT-ID]:key/e947a771-6134-4157-b3a7-94f3167bd19e"
+      Effect: Allow
+
+    - Condition:
+        StringLike:
+          kms:ViaService: s3.ap-southeast-2.amazonaws.com
+          "kms:EncryptionContext:aws:s3:arn":
+            - "arn:aws:s3:::siem-logging-bucket-ap-southeast-2"
+      Action:
+        - kms:Encrypt
+        - kms:Decrypt
+        - kms:DescribeKey
+        - "kms:ReEncrypt*"
+      Resource:
+        - "arn:aws:kms:ap-southeast-2:[LOGGING-ACCOUNT-ID]:key/12516584-d518-4b3a-a212-e183b1c53ec9"
+      Effect: Allow

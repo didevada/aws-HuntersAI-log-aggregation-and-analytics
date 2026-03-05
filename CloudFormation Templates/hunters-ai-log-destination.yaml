@@ -1,0 +1,616 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  CloudWatch Logs subscription stack for member accounts. 
+  Creates a Lambda Function to subscribe CloudWatch Log Groups to Kinesis Firehose Streams 
+  for forwarding to S3 in the central logging account.
+
+#### CloudFormation interface metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups: 
+      - 
+        Label: 
+          default: "Common Parameters"
+        Parameters:
+          - SubscribeExistingLogGroups
+          - CentralLoggingAccountId 
+      - 
+        Label:
+          default: "Standard CloudWatch Logs subscription"
+        Parameters:
+          - CWLDestinationARN
+
+    ParameterLabels:
+      CentralLoggingAccountId:
+        default: "Logging Account ID"
+      CWLDestinationARN: 
+        default: "Log Destination ARN for standard CloudWatch Log Groups subscription"
+      SubscribeExistingLogGroups: 
+        default: "Subscribe existing matching Log Groups"
+
+#### Template Parameters
+Parameters:
+  CentralLoggingAccountId:
+    Description: 'Account ID where central logging stack is deployed'
+    Type: String
+    AllowedPattern: '[0-9]+'
+    ConstraintDescription: Must be a valid 12-digit AWS Account ID
+
+  SubscribeExistingLogGroups:
+    Description: 'Do you want Lambda to subscribe existing Log Groups? If not, only future created matching Log Groups will be subscribed'
+    Type: String
+    AllowedValues: 
+      - yes
+      - no
+    Default: yes
+
+  CWLDestinationARN:
+    Description: ARN of CloudWatch Log Destination from central logging stack e.g. arn:aws:logs:<region>:<account-id>:destination:CWLogsToS3
+    Type: String
+    AllowedPattern: 'arn:aws:logs:[a-z0-9-]+:[0-9]{12}:destination:.+'
+    ConstraintDescription: Must be a valid CloudWatch Logs destination ARN
+
+#### Template Conditions
+Conditions:
+  SubscribeExistingLogGroups: !Equals [!Ref SubscribeExistingLogGroups, yes]
+
+#### Resources
+Resources:
+  
+  #######################################
+  # IAM Policies
+  #######################################
+  
+  CWLogGroupSubscribePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${AWS::StackName}-CWLogGroupSubscribePolicy'
+      Description: IAM Policy for Lambda Function that will subscribe CloudWatch Log Groups to CW Destination in another account
+      Path: /
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowDescribeLogGroups
+            Effect: Allow
+            Action:
+              - logs:DescribeLogGroups
+              - logs:DescribeSubscriptionFilters
+              - logs:ListTagsLogGroup
+            Resource: '*'
+          
+          - Sid: AllowPutDeleteSubscriptionFilter
+            Effect: Allow
+            Action:
+              - logs:PutSubscriptionFilter
+              - logs:DeleteSubscriptionFilter
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+              - !Sub 'arn:${AWS::Partition}:logs:*:${CentralLoggingAccountId}:destination:*'
+          
+          - Sid: AllowSSMParameterAccess
+            Effect: Allow
+            Action:
+              - ssm:GetParameter
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/CWLPrefixListParameter-*'
+              - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/CWLDestinationParameter-*'
+
+  #######################################
+  # IAM Roles
+  #######################################
+  
+  CWLogGroupSubscribeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-LogGroupSubscribeRole'
+      Description: Role for Lambda function to subscribe CloudWatch Log Groups
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !Ref CWLogGroupSubscribePolicy
+      Tags:
+        - Key: AppName
+          Value: HuntersAI-SIEM-Integration
+        - Key: Name
+          Value: cwl-log-group-subscribe-lambda-role
+        - Key: ManagedBy
+          Value: CloudFormation
+  
+  CWLogGroupValidatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-LogGroupValidatorRole'
+      Description: Role for CloudWatch Logs to validate subscription filters
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action: sts:AssumeRole
+            Condition:
+              StringLike:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Path: /
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Tags:
+        - Key: AppName
+          Value: HuntersAI-SIEM-Integration
+        - Key: Name
+          Value: cwl-log-group-validator-role
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  #######################################
+  # Lambda Function
+  #######################################
+  
+  LogGroupSubscribeLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-LogGroupSubscribeLambda'
+      Description: Automatically subscribes CloudWatch Log Groups to central logging destination
+      ReservedConcurrentExecutions: 100
+      Handler: index.lambda_handler
+      Runtime: python3.11
+      Role: !GetAtt CWLogGroupSubscribeRole.Arn 
+      Timeout: 900
+      MemorySize: 256
+      Environment:
+        Variables:
+          DESTINATION_ARN: !Ref CWLDestinationARN
+          FILTER_NAME: !Ref AWS::StackName
+          VALIDATOR_ROLE_ARN: !GetAtt CWLogGroupValidatorRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import os
+          import traceback
+
+          # Create clients
+          cwl_client = boto3.client('logs')
+
+          # Get environment variables
+          filter_name = os.environ.get('FILTER_NAME')
+          destination_arn = os.environ.get('DESTINATION_ARN')
+          validator_role_arn = os.environ.get('VALIDATOR_ROLE_ARN')
+
+          def lambda_handler(event, context):
+              """
+              Main Lambda handler that processes events from EventBridge or CloudFormation
+              """
+              print(f"Received event: {event}")
+              
+              try:
+                  # Handle invocations from Events or CFN service
+                  if event.get('detail'):
+                      # Assume EventBridge event
+                      handle_event_invoke(event)
+                      return {
+                          'statusCode': 200,
+                          'body': 'Successfully processed EventBridge event'
+                      }
+                  
+                  elif event.get('RequestType'):
+                      # Assume CloudFormation custom resource
+                      handle_cfn_invoke(event, context)
+                  
+                  else:
+                      print("Unknown event type received")
+                      return {
+                          'statusCode': 400,
+                          'body': 'Unknown event type'
+                      }
+              
+              except Exception as error:
+                  print(f"Error in lambda_handler: {repr(error)}")
+                  print(traceback.format_exc())
+                  if event.get('RequestType'):
+                      cfnresponse.send(event, context, cfnresponse.FAILED, 
+                                      {'Error': str(error)})
+                  raise
+
+          def handle_event_invoke(event):
+              """
+              Handle EventBridge events for new log group creation
+              """
+              try:
+                  if event['detail']['eventName'] == 'CreateLogGroup':
+                      log_group_name = event['detail']['requestParameters']['logGroupName']
+                      print(f"Inspecting request parameters for new log group: '{log_group_name}'")
+                      
+                      if log_group_name:
+                          subscribe_new_log_group(log_group_name)
+                      else:
+                          print("No log group name found in event")
+                  else:
+                      print(f"Event is not CreateLogGroup: {event['detail']['eventName']}")
+              
+              except Exception as error:
+                  print(f"Error handling EventBridge event: {repr(error)}")
+                  print(traceback.format_exc())
+                  raise
+
+          def handle_cfn_invoke(event, context):
+              """
+              Handle CloudFormation custom resource events
+              """
+              try:
+                  request_type = event['RequestType']
+                  print(f"CloudFormation request type: {request_type}")
+                  
+                  if request_type in ['Create', 'Update']:
+                      if event['ResourceProperties'].get('SubscribeExistingLogGroups') == 'True':
+                          subscribe_existing_log_groups(event, context)
+                      else:
+                          print("SubscribeExistingLogGroups is not True, skipping")
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                          {'Response': 'No actions taken due to SubscribeExistingLogGroups = no'})
+                  
+                  elif request_type == 'Delete':
+                      delete_sub_existing_group(event, context, filter_name)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                      {'Response': 'Deleted subscription filters from all log groups as stack is deleted'})
+                  
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                      {'Response': 'No action required'})
+              
+              except Exception as error:
+                  print(f"Error handling CloudFormation event: {repr(error)}")
+                  print(traceback.format_exc())
+                  cfnresponse.send(event, context, cfnresponse.FAILED, 
+                                  {'Error': str(error)})
+
+          def add_sub_existing_group(filter_name, destination_arn):
+              """
+              Add subscription filters to all existing log groups
+              """
+              subscription_count = 0
+              skipped_count = 0
+              error_count = 0
+              
+              try:
+                  paginator = cwl_client.get_paginator('describe_log_groups')
+                  
+                  for response in paginator.paginate():
+                      for log_group in response['logGroups']:
+                          log_group_name = log_group['logGroupName']
+                          
+                          try:
+                              filters = cwl_client.describe_subscription_filters(
+                                  logGroupName=log_group_name
+                              )
+                              
+                              if len(filters['subscriptionFilters']) >= 2:
+                                  print(f"Skipped '{log_group_name}' - already has 2 subscription filters (AWS limit)")
+                                  skipped_count += 1
+                                  continue
+                              
+                              existing_filter = next(
+                                  (f for f in filters['subscriptionFilters'] if f['filterName'] == filter_name),
+                                  None
+                              )
+                              
+                              if existing_filter:
+                                  print(f"Skipped '{log_group_name}' - subscription filter already exists")
+                                  skipped_count += 1
+                                  continue
+                              
+                              cwl_client.put_subscription_filter(
+                                  logGroupName=log_group_name,
+                                  filterName=filter_name,
+                                  filterPattern='',
+                                  destinationArn=destination_arn,
+                                  roleArn=validator_role_arn
+                              )
+                              
+                              print(f"Added subscription filter to log group: '{log_group_name}'")
+                              subscription_count += 1
+                          
+                          except Exception as error:
+                              print(f"Error subscribing log group '{log_group_name}': {repr(error)}")
+                              error_count += 1
+                  
+                  print(f"Summary: Subscribed={subscription_count}, Skipped={skipped_count}, Errors={error_count}")
+              
+              except Exception as error:
+                  print(f"Error in add_sub_existing_group: {repr(error)}")
+                  print(traceback.format_exc())
+                  raise
+
+          def delete_sub_existing_group(event, context, filter_name):
+              """
+              Delete subscription filters from all log groups when stack is deleted
+              """
+              deleted_count = 0
+              not_found_count = 0
+              error_count = 0
+              
+              try:
+                  paginator = cwl_client.get_paginator('describe_log_groups')
+                  
+                  for response in paginator.paginate():
+                      for log_group in response['logGroups']:
+                          log_group_name = log_group['logGroupName']
+                          
+                          try:
+                              cwl_client.delete_subscription_filter(
+                                  logGroupName=log_group_name,
+                                  filterName=filter_name
+                              )
+                              print(f"Deleted subscription filter from log group: '{log_group_name}'")
+                              deleted_count += 1
+                          
+                          except cwl_client.exceptions.ResourceNotFoundException:
+                              not_found_count += 1
+                          
+                          except Exception as error:
+                              print(f"Error deleting subscription filter from '{log_group_name}': {repr(error)}")
+                              error_count += 1
+                  
+                  print(f"Deletion Summary: Deleted={deleted_count}, NotFound={not_found_count}, Errors={error_count}")
+              
+              except Exception as error:
+                  print(f"Error in delete_sub_existing_group: {repr(error)}")
+                  print(traceback.format_exc())
+                  raise
+
+          def subscribe_existing_log_groups(event, context):
+              """
+              Subscribe all existing log groups (called during CloudFormation Create/Update)
+              """
+              try:
+                  subscribe_existing_log_group = event['ResourceProperties'].get('SubscribeExistingLogGroups')
+                  
+                  if subscribe_existing_log_group == 'True':
+                      print(f"Subscribing existing log groups to destination: {destination_arn}")
+                      add_sub_existing_group(filter_name, destination_arn)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                      {'Response': 'Successfully subscribed existing log groups'})
+                  else:
+                      print("SubscribeExistingLogGroups is not True")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                      {'Response': 'No actions taken due to SubscribeExistingLogGroups = no'})
+              
+              except Exception as error:
+                  print(f"Error subscribing existing log groups: {repr(error)}")
+                  print(traceback.format_exc())
+                  cfnresponse.send(event, context, cfnresponse.FAILED, 
+                                  {'Response': f'Failed to subscribe existing log groups: {str(error)}'})
+
+          def subscribe_new_log_group(log_group_name):
+              """
+              Subscribe a newly created log group to the central destination
+              """
+              try:
+                  print(f"New log group created: '{log_group_name}'")
+                  print(f"Adding subscription filter with destination: '{destination_arn}'")
+                  
+                  filters = cwl_client.describe_subscription_filters(
+                      logGroupName=log_group_name
+                  )
+                  
+                  if any(f['filterName'] == filter_name for f in filters['subscriptionFilters']):
+                      print(f"Subscription filter already exists for '{log_group_name}'")
+                      return
+                  
+                  if len(filters['subscriptionFilters']) >= 2:
+                      print(f"Cannot add subscription filter to '{log_group_name}' - already has 2 filters (AWS limit)")
+                      return
+                  
+                  cwl_client.put_subscription_filter(
+                      logGroupName=log_group_name,
+                      filterName=filter_name,
+                      filterPattern='',
+                      destinationArn=destination_arn,
+                      roleArn=validator_role_arn
+                  )
+                  
+                  print(f"Successfully added subscription filter to '{log_group_name}'")
+              
+              except Exception as error:
+                  print(f"Error subscribing new log group '{log_group_name}': {repr(error)}")
+                  print(traceback.format_exc())
+      Tags:
+        - Key: AppName
+          Value: HuntersAI-SIEM-Integration
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-LogGroupSubscribeLambda'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  #######################################
+  # Lambda CloudWatch Log Group
+  #######################################
+  
+  LogGroupSubscribeLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LogGroupSubscribeLambda}'
+      RetentionInDays: 30
+
+  #######################################
+  # Lambda Monitoring
+  #######################################
+  
+  CWLogGroupSubscribeLambdaAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-LogGroupSubscribeLambda-SuccessRate'
+      AlarmDescription: "Alarm when Lambda success rate drops below 100%"
+      ComparisonOperator: LessThanThreshold
+      EvaluationPeriods: 3
+      Threshold: 100
+      TreatMissingData: notBreaching
+      ActionsEnabled: true
+      Metrics:
+        - Id: errors
+          ReturnData: false
+          MetricStat:
+            Period: 300
+            Stat: Sum
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions: 
+                - Name: FunctionName
+                  Value: !Ref LogGroupSubscribeLambda
+        
+        - Id: invocations
+          ReturnData: false
+          MetricStat:
+            Period: 300
+            Stat: Sum
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Invocations
+              Dimensions: 
+                - Name: FunctionName
+                  Value: !Ref LogGroupSubscribeLambda
+        
+        - Expression: "100 - 100 * errors / MAX([errors, invocations])"
+          Id: availability
+          Label: "Success rate (%)"
+  
+  CWLogGroupSubscribeLambdaThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-LogGroupSubscribeLambda-Throttles'
+      AlarmDescription: "Alarm when Lambda function is throttled"
+      MetricName: Throttles
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LogGroupSubscribeLambda
+
+  #######################################
+  # Lambda Permissions
+  #######################################
+  
+  LambdaPermissionForCFNInvokeFunction:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LogGroupSubscribeLambda.Arn
+      Principal: cloudformation.amazonaws.com
+      SourceArn: !Ref AWS::StackId
+
+  LambdaPermissionForEventBridgeInvokeFunction:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LogGroupSubscribeLambda.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventRuleNewLogGroupCreated.Arn
+
+  #######################################
+  # EventBridge Rule
+  #######################################
+  
+  EventRuleNewLogGroupCreated:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-NewLogGroupCreated'
+      Description: Event rule for identifying new CloudWatch Logs log groups and calling Lambda to add subscription filters
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.logs
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - logs.amazonaws.com
+          eventName:
+            - CreateLogGroup
+      Targets:
+        - Arn: !GetAtt LogGroupSubscribeLambda.Arn
+          Id: InvokeLambdaForNewLogGroup
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAge: 3600
+
+  #######################################
+  # Custom Resource to Subscribe Existing Log Groups
+  #######################################
+  
+  CustomInvokeLambdaSubscribeExistingLogGroups:
+    Type: Custom::InvokeLogGroupSubscribeLambda
+    DependsOn:
+      - LambdaPermissionForCFNInvokeFunction
+      - LogGroupSubscribeLambdaLogGroup
+    Condition: SubscribeExistingLogGroups
+    Properties:
+      ServiceToken: !GetAtt LogGroupSubscribeLambda.Arn
+      SubscribeExistingLogGroups: 'True'
+      Timestamp: !Sub '${AWS::StackName}-${AWS::StackId}'
+
+#### Outputs
+Outputs:
+  
+  SubscribeLogGroupLambdaARN:
+    Description: ARN of the Lambda function that subscribes log groups
+    Value: !GetAtt LogGroupSubscribeLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaArn'
+  
+  SubscribeLogGroupLambdaName:
+    Description: Name of the Lambda function that subscribes log groups
+    Value: !Ref LogGroupSubscribeLambda
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaName'
+  
+  CWLogGroupSubscribeRoleArn:
+    Description: ARN of the IAM role used by the Lambda function
+    Value: !GetAtt CWLogGroupSubscribeRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaRoleArn'
+  
+  CWLogGroupValidatorRoleArn:
+    Description: ARN of the IAM role used for CloudWatch Logs validation
+    Value: !GetAtt CWLogGroupValidatorRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ValidatorRoleArn'
+  
+  EventRuleArn:
+    Description: ARN of the EventBridge rule for new log group detection
+    Value: !GetAtt EventRuleNewLogGroupCreated.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventRuleArn'
+  
+  DestinationARN:
+    Description: CloudWatch Logs destination ARN being used
+    Value: !Ref CWLDestinationARN
+    Export:
+      Name: !Sub '${AWS::StackName}-DestinationArn'
+  
+  SubscriptionFilterName:
+    Description: Name of the subscription filter applied to log groups
+    Value: !Ref AWS::StackName
+    Export:
+      Name: !Sub '${AWS::StackName}-FilterName'
+  
+  LambdaSuccessRateAlarmName:
+    Description: Name of the CloudWatch alarm monitoring Lambda success rate
+    Value: !Ref CWLogGroupSubscribeLambdaAlarm
+  
+  LambdaThrottleAlarmName:
+    Description: Name of the CloudWatch alarm monitoring Lambda throttles
+    Value: !Ref CWLogGroupSubscribeLambdaThrottleAlarm

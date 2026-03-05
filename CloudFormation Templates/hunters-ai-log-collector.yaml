@@ -1,0 +1,825 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template to create Kinesis Data Stream, Firehose,
+  and S3 bucket for centralized log storage with SIEM integration
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Name of the S3 bucket to store logs
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    ConstraintDescription: Bucket name must be lowercase, alphanumeric, and may contain hyphens
+
+  LogsPrefix:
+    Type: String
+    Description: Prefix for the S3 bucket to store logs
+    Default: logs/
+
+  S3DataExpirationInDays:
+    Type: String
+    Description: Number of days in which the log objects in S3 will be deleted
+    Default: '365'
+
+  MemberAccountIDs:
+    Type: CommaDelimitedList
+    Description: Comma Delimited list of member accounts that need to be allowed to
+      write into the central S3 bucket
+
+  DetectorID:
+    Type: String
+    Description: Detector ID of your GuardDuty Administrator Account
+
+  GDPrimaryRegion:
+    Type: String
+    Description: Primary region of your GuardDuty Administrator account
+    Default: us-east-1
+
+  GDAdministratorAccount:
+    Type: String
+    Description: AWS Account ID of the GuardDuty Administrator
+    AllowedPattern: ^\d{12}$
+    ConstraintDescription: Must be a valid 12-digit AWS Account ID
+
+  OrgId:
+    Type: String
+    Description: Organization ID for the organization
+    AllowedPattern: ^o-[a-z0-9]{10,32}$
+    ConstraintDescription: Must be a valid AWS Organization ID (e.g., o-abc1234567)
+
+  CreateNewBucket:
+    Type: String
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+    Description: Set to false if you want to use an existing bucket
+
+  MonitoredCloudTrailARN:
+    Type: String
+    Description: ARN of the CloudTrail trail to be monitored by HuntersAI
+
+  KinesisStreamName:
+    Type: String
+    Description: Name of the Kinesis Data Stream
+    Default: CWLogCollectorDataStream
+
+  KinesisShardCount:
+    Type: Number
+    Description: Number of shards for the Kinesis Data Stream
+    Default: 1
+    MinValue: 1
+    MaxValue: 100
+
+  KinesisRetentionHours:
+    Type: Number
+    Description: Retention period in hours for Kinesis Data Stream
+    Default: 24
+    MinValue: 24
+    MaxValue: 8760
+
+  FirehoseDeliveryStreamName:
+    Type: String
+    Description: Name of the Kinesis Firehose Delivery Stream
+    Default: CWLogsToS3
+
+  CWLogDestinationName:
+    Type: String
+    Description: Name of the CloudWatch Logs destination
+    Default: CWLogsToS3
+
+  FirehoseBufferIntervalSeconds:
+    Type: Number
+    Description: Buffer interval in seconds for Firehose
+    Default: 60
+    MinValue: 60
+    MaxValue: 900
+
+  FirehoseBufferSizeMB:
+    Type: Number
+    Description: Buffer size in MB for Firehose
+    Default: 5
+    MinValue: 1
+    MaxValue: 128
+
+  LambdaTransformationFunctionName:
+    Type: String
+    Description: Name of the Lambda function for log transformation
+    Default: SIEM_CWToS3_LogTransformation
+
+  AlarmThresholdBytes:
+    Type: Number
+    Description: Threshold in bytes for Kinesis shard usage alarm (80% of 1MB/sec =
+      2359296 bytes per 5 min)
+    Default: 2359296
+
+  ExternalID:
+    Type: String
+    Description: External ID for Hunters AI role assumption
+    NoEcho: true
+    MinLength: 2
+    MaxLength: 1224
+    ConstraintDescription: External ID must be between 2 and 1224 characters
+
+Conditions:
+  ShouldCreateBucket: !Equals
+    - !Ref CreateNewBucket
+    - 'true'
+
+Resources:
+  SIEMBucketReadOnlyPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AWS::StackName}-SIEMBucketReadOnlyPolicy
+      Description: Policy for S3 bucket read-only access
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: s3:ListAllMyBuckets
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:GetObject
+              - s3:GetBucketLocation
+            Resource:
+              - !Sub arn:aws:s3:::${BucketName}
+              - !Sub arn:aws:s3:::${BucketName}/*
+
+  HuntersAIReadOnlyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-HuntersAIReadOnlyRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: arn:aws:iam::685648138888:root
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ExternalID
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref SIEMBucketReadOnlyPolicy
+      Tags:
+        - Key: Purpose
+          Value: SIEMLogAccess
+        - Key: Environment
+          Value: SIEM
+
+  KMSKey:
+    Type: 'AWS::KMS::Key'
+    DependsOn: HuntersAIReadOnlyRole
+    Properties:
+      Description: HuntersAI Logging Bucket Encryption Key
+      EnableKeyRotation: true
+      PendingWindowInDays: 20
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: HuntersAI Key policy
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow Logs Delivery to use the key
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ForAnyValue:StringEquals:
+                aws:SourceAccount: !Ref MemberAccountIDs
+              ArnLike:
+                aws:SourceArn:
+                  - arn:aws:logs:*:*:log-group:*
+          - Sid: Allow GuardDuty to encrypt findings
+            Effect: Allow
+            Principal:
+              Service: guardduty.amazonaws.com
+            Action: kms:GenerateDataKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref GDAdministratorAccount
+                aws:SourceArn: !Sub arn:aws:guardduty:${GDPrimaryRegion}:${GDAdministratorAccount}:detector/${DetectorID}
+          - Sid: Allow CloudTrail to encrypt logs
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:Describe*
+              - kms:GenerateDataKey*
+            Resource: '*'
+            Condition:
+              StringLike:
+                kms:EncryptionContext:aws:cloudtrail:arn: !Ref MonitoredCloudTrailARN
+          - Sid: Allow s3 and cloudwatch log, firehose and kinesis data stream to encrypt logs
+            Effect: Allow
+            Principal:
+              Service:
+                - logs.amazonaws.com
+                - s3.amazonaws.com
+                - firehose.amazonaws.com
+                - kinesis.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:Describe*
+              - kms:GenerateDataKey*
+            Resource: '*'
+          - Sid: Encrypt permission on SIEM Key
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-HuntersAIReadOnlyRole
+            Action:
+              - kms:Describe*
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:Encrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+          - Sid: Allow Hunters AI Account to Decrypt
+            Effect: Allow
+            Principal:
+              AWS: arn:aws:iam::685648138888:root
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:ViaService:
+                  - !Sub s3.${AWS::Region}.amazonaws.com
+
+  KMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${AWS::StackName}-hunters-siem-key
+      TargetKeyId: !Ref KMSKey
+
+  KMSDecryptPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AWS::StackName}-KMSDecryptPolicy
+      Description: Policy for KMS decrypt permissions
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:GenerateDataKey
+            Resource: !GetAtt KMSKey.Arn
+      Roles:
+        - !Sub ${AWS::StackName}-HuntersAIReadOnlyRole
+
+  LogBucket:
+    Type: AWS::S3::Bucket
+    Condition: ShouldCreateBucket
+    DependsOn: KMSKey
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt KMSKey.Arn
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DefaultLifecycleRule
+            Status: Enabled
+            ExpirationInDays: !Ref S3DataExpirationInDays
+            NoncurrentVersionExpirationInDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LogBucket
+        LogFilePrefix: access-logs/
+      Tags:
+        - Key: Purpose
+          Value: CentralizedLogging
+        - Key: Environment
+          Value: SIEM
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: ShouldCreateBucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Bucket: !Ref LogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Id: SIEMWritePermissions
+        Statement:
+          - Sid: S3PutObject
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::${BucketName}/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceAccount: !Ref MemberAccountIDs
+              ArnLike:
+                aws:SourceArn: arn:aws:logs:*:*:log-group:*
+
+          - Sid: LogDeliveryAcl
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub arn:aws:s3:::${BucketName}
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref MemberAccountIDs
+              ArnLike:
+                aws:SourceArn: arn:aws:logs:*:*:log-group:*
+
+          - Sid: CWLogsGetAcl
+            Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub arn:aws:s3:::${BucketName}
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref MemberAccountIDs
+              ArnLike:
+                aws:SourceArn: arn:aws:logs:*:*:log-group:*
+
+          - Sid: CWLogsPutObject
+            Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::${BucketName}/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceAccount: !Ref MemberAccountIDs
+              ArnLike:
+                aws:SourceArn: arn:aws:logs:*:*:log-group:*
+
+          - Sid: MemberPutObject
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::${BucketName}/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+          - Sid: AWSCloudTrailS3ReadPermissions
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub arn:aws:s3:::${BucketName}
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Ref MonitoredCloudTrailARN
+
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::${BucketName}/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceArn: !Ref MonitoredCloudTrailARN
+
+          - Sid: GuardDutyPutObject
+            Effect: Allow
+            Principal:
+              Service: guardduty.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::${BucketName}/*
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub arn:aws:guardduty:${GDPrimaryRegion}:${GDAdministratorAccount}:detector/${DetectorID}
+                aws:SourceAccount: !Ref GDAdministratorAccount
+
+          - Sid: GuardDutyGetBucketLocation
+            Effect: Allow
+            Principal:
+              Service: guardduty.amazonaws.com
+            Action: s3:GetBucketLocation
+            Resource: !Sub arn:aws:s3:::${BucketName}
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub arn:aws:guardduty:${GDPrimaryRegion}:${GDAdministratorAccount}:detector/${DetectorID}
+                aws:SourceAccount: !Ref GDAdministratorAccount
+
+          - Sid: GuardDutyDenyIncorrectEncryption
+            Effect: Deny
+            Principal:
+              Service: guardduty.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::${BucketName}/*
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption-aws-kms-key-id: !GetAtt KMSKey.Arn
+
+          - Sid: GuardDutyDenyUnencrypted
+            Effect: Deny
+            Principal:
+              Service: guardduty.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::${BucketName}/*
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: aws:kms
+
+          - Sid: GuardDutyDenyNonHTTPS
+            Effect: Deny
+            Principal:
+              Service: guardduty.amazonaws.com
+            Action: s3:*
+            Resource: !Sub arn:aws:s3:::${BucketName}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+          - Sid: FirehoseAccess
+            Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action:
+              - s3:AbortMultipartUpload
+              - s3:GetBucketLocation
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:ListBucketMultipartUploads
+              - s3:PutObject
+              - s3:PutObjectAcl
+              - s3:GetBucketAcl
+            Resource:
+              - !Sub arn:aws:s3:::${BucketName}
+              - !Sub arn:aws:s3:::${BucketName}/*
+
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !Sub arn:aws:s3:::${BucketName}
+              - !Sub arn:aws:s3:::${BucketName}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+          - Sid: HuntersAIReadAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt HuntersAIReadOnlyRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource:
+              - !Sub arn:aws:s3:::${BucketName}
+              - !Sub arn:aws:s3:::${BucketName}/*
+
+  KinesisDataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Ref KinesisStreamName
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      ShardCount: !Ref KinesisShardCount
+      RetentionPeriodHours: !Ref KinesisRetentionHours
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: !GetAtt KMSKey.Arn
+      Tags:
+        - Key: Environment
+          Value: CW-Logs-Collector
+        - Key: Purpose
+          Value: SIEM
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  KinesisShardUsageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn:
+      - KinesisDataStream
+    Properties:
+      AlarmName: !Sub ${KinesisStreamName}-ShardUsageAlarm
+      AlarmDescription: Alarm if shard usage exceeds 80% of capacity
+      MetricName: IncomingBytes
+      Namespace: AWS/Kinesis
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref AlarmThresholdBytes
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref KinesisDataStream
+      TreatMissingData: notBreaching
+      AlarmActions: []
+      Tags:
+        - Key: Purpose
+          Value: SIEM-Monitoring
+
+  KinesisIteratorAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn:
+      - KinesisDataStream
+    Properties:
+      AlarmName: !Sub ${KinesisStreamName}-IteratorAgeAlarm
+      AlarmDescription: Alarm if Kinesis iterator age exceeds 5 minutes
+      MetricName: GetRecords.IteratorAgeMilliseconds
+      Namespace: AWS/Kinesis
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 300000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref KinesisDataStream
+      TreatMissingData: notBreaching
+
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    DependsOn:
+      - KinesisDataStream
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-FirehoseDeliveryRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: FirehoseS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::${BucketName}
+                  - !Sub arn:aws:s3:::${BucketName}/*
+
+        - PolicyName: FirehoseKinesisAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                Resource: !GetAtt KinesisDataStream.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt KMSKey.Arn
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub kinesis.${AWS::Region}.amazonaws.com
+                  StringLike:
+                    kms:EncryptionContext:aws:kinesis:arn: !GetAtt KinesisDataStream.Arn
+
+        - PolicyName: FirehoseCloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/${FirehoseDeliveryStreamName}:*
+
+        - PolicyName: FirehoseLambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunctionConfiguration
+                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaTransformationFunctionName}:$LATEST
+
+      Tags:
+        - Key: Purpose
+          Value: SIEM-Firehose
+
+  KinesisStreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-KinesisStreamRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KinesisStreamAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:ListShards
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: !GetAtt KinesisDataStream.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:ReEncryptTo
+                  - kms:GenerateDataKeyWithoutPlaintext
+                  - kms:GenerateDataKeyPairWithoutPlaintext
+                  - kms:GenerateDataKeyPair
+                  - kms:ReEncryptFrom
+                Resource: !GetAtt KMSKey.Arn
+      Tags:
+        - Key: Purpose
+          Value: SIEM-Kinesis
+
+  CWLogDestination:
+    Type: AWS::Logs::Destination
+    DependsOn:
+      - KinesisDataStream
+      - KinesisStreamRole
+    Properties:
+      DestinationName: !Ref CWLogDestinationName
+      RoleArn: !GetAtt KinesisStreamRole.Arn
+      TargetArn: !GetAtt KinesisDataStream.Arn
+      DestinationPolicy: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AllowOrganizationAccess",
+              "Effect": "Allow",
+              "Principal": "*",
+              "Action": "logs:PutSubscriptionFilter",
+              "Resource": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:destination:${CWLogDestinationName}",
+              "Condition": {
+                "StringEquals": {
+                  "aws:PrincipalOrgID": "${OrgId}"
+                }
+              }
+            }
+          ]
+        }
+
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/kinesisfirehose/${FirehoseDeliveryStreamName}
+      RetentionInDays: 7
+
+  FirehoseLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref FirehoseLogGroup
+      LogStreamName: !Ref FirehoseDeliveryStreamName
+
+  FirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn:
+      - KinesisDataStream
+      - FirehoseDeliveryRole
+      - FirehoseLogGroup
+      - FirehoseLogStream
+    Properties:
+      DeliveryStreamName: !Ref FirehoseDeliveryStreamName
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt KinesisDataStream.Arn
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Sub arn:aws:s3:::${BucketName}
+        CompressionFormat: GZIP
+        Prefix: !Ref LogsPrefix
+        ErrorOutputPrefix: !Sub ${LogsPrefix}errors/
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        BufferingHints:
+          IntervalInSeconds: !Ref FirehoseBufferIntervalSeconds
+          SizeInMBs: !Ref FirehoseBufferSizeMB
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogGroup
+          LogStreamName: !Ref FirehoseLogStream
+        EncryptionConfiguration:
+          KMSEncryptionConfig:
+            AWSKMSKeyARN: !GetAtt KMSKey.Arn
+        ProcessingConfiguration:
+          Enabled: false
+        S3BackupMode: Disabled
+
+  FirehoseDeliverySuccessAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn:
+      - FirehoseDeliveryStream
+    Properties:
+      AlarmName: !Sub ${FirehoseDeliveryStreamName}-DeliveryFailureAlarm
+      AlarmDescription: Alarm if Firehose delivery to S3 fails
+      MetricName: DeliveryToS3.Success
+      Namespace: AWS/Firehose
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0.95
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: DeliveryStreamName
+          Value: !Ref FirehoseDeliveryStream
+      TreatMissingData: notBreaching
+
+  FirehoseDataFreshnessAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn:
+      - FirehoseDeliveryStream
+    Properties:
+      AlarmName: !Sub ${FirehoseDeliveryStreamName}-DataFreshnessAlarm
+      AlarmDescription: Alarm if data freshness exceeds 15 minutes
+      MetricName: DeliveryToS3.DataFreshness
+      Namespace: AWS/Firehose
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 900000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DeliveryStreamName
+          Value: !Ref FirehoseDeliveryStream
+      TreatMissingData: notBreaching
+
+Outputs:
+  KMSKeyArn:
+    Description: ARN of the KMS key for SIEM encryption
+    Value: !GetAtt KMSKey.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-KMSKeyArn
+
+  KMSKeyId:
+    Description: ID of the KMS key for SIEM encryption
+    Value: !Ref KMSKey
+    Export:
+      Name: !Sub ${AWS::StackName}-KMSKeyId
+
+  HuntersAIReadOnlyRoleName:
+    Description: Name of the Hunters AI read-only role
+    Value: !Ref HuntersAIReadOnlyRole
+    Export:
+      Name: !Sub ${AWS::StackName}-HuntersAIReadOnlyRoleName
+
+  HuntersAIReadOnlyRoleArn:
+    Description: ARN of the Hunters AI Role
